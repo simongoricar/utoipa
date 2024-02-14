@@ -108,23 +108,26 @@ fn merge_response_contents(existing_content: &mut Content, new_content: Content)
         // The keys will be derived from the hashed [`Example`][super::example::Example]s
         // using the default hasher.
 
-        let new_content_example_value = new_content.example.unwrap();
-        let new_content_example_value_display = new_content_example_value.to_string();
-        let new_content_example = super::example::Example {
-            value: Some(new_content_example_value),
-            ..Default::default()
-        };
-        let new_content_example_hash = {
-            let mut default_hasher = DefaultHasher::new();
-            new_content_example_value_display.hash(&mut default_hasher);
-            default_hasher.finish().to_string()
-        };
+        if let Some(new_content_example_value) = new_content.example {
+            let new_content_example_value_display = new_content_example_value.to_string();
+            let new_content_example = super::example::Example {
+                value: Some(new_content_example_value),
+                ..Default::default()
+            };
+            let new_content_example_hash = {
+                let mut default_hasher = DefaultHasher::new();
+                new_content_example_value_display.hash(&mut default_hasher);
+                default_hasher.finish().to_string()
+            };
 
-        existing_content
-            .examples
-            .insert(new_content_example_hash, RefOr::T(new_content_example));
+            existing_content
+                .examples
+                .insert(new_content_example_hash, RefOr::T(new_content_example));
+        }
 
         existing_content.examples.extend(new_content.examples);
+    } else {
+        existing_content.example = new_content.example;
     }
 
     MergeResult::Merged
