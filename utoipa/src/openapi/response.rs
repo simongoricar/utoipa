@@ -1,7 +1,9 @@
 //! Implements [OpenApi Responses][responses].
 //!
 //! [responses]: https://spec.openapis.org/oas/latest.html#responses-object
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,141 @@ builder! {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MergeResult {
+    Merged,
+    NonMergeable,
+}
+
+fn merge_response_contents(existing_content: &mut Content, new_content: Content) -> MergeResult {
+    // Attempt to merge `Content`s.
+    match (&mut existing_content.schema, new_content.schema) {
+        (RefOr::Ref(existing_schema_ref), RefOr::Ref(new_schema_ref)) => {
+            if existing_schema_ref.ref_location != new_schema_ref.ref_location {
+                // The responses don't point to the same object, we must give up on the merge.
+                return MergeResult::NonMergeable;
+            }
+        }
+        (RefOr::T(existing_schema), RefOr::T(mut new_schema)) => {
+            if existing_schema != &mut new_schema {
+                // The response schemas are not the same, which means we can't merge.
+                return MergeResult::NonMergeable;
+            }
+        }
+        _ => {
+            // There's one schema by reference and one concrete schema, which means
+            // we must give up on the merge.
+            return MergeResult::NonMergeable;
+        }
+    };
+
+    // Smartly merge examples by switching to `examples` from `example` if there are multiple.
+    if let Some(existing_example) = &mut existing_content.example {
+        if new_content.example.is_some() || !new_content.examples.is_empty() {
+            // We'll need to collect and switch all examples to the `examples` field.
+            // The keys will be derived from the hashed [`Example`][super::example::Example]s
+            // using the default hasher.
+
+            let existing_content_example_value = existing_example.to_owned();
+            let existing_content_example_value_display = existing_content_example_value.to_string();
+            let existing_content_example = super::example::Example {
+                value: Some(existing_content_example_value),
+                ..Default::default()
+            };
+            let existing_content_example_hash = {
+                let mut default_hasher = DefaultHasher::new();
+                existing_content_example_value_display.hash(&mut default_hasher);
+                default_hasher.finish().to_string()
+            };
+
+            existing_content.examples.insert(
+                existing_content_example_hash,
+                RefOr::T(existing_content_example),
+            );
+
+            // PANIC SAFETY: We just called `is_some`.
+            let new_content_example_value = new_content.example.unwrap();
+            let new_content_example_value_display = new_content_example_value.to_string();
+            let new_content_example = super::example::Example {
+                value: Some(new_content_example_value),
+                ..Default::default()
+            };
+            let new_content_example_hash = {
+                let mut default_hasher = DefaultHasher::new();
+                new_content_example_value_display.hash(&mut default_hasher);
+                default_hasher.finish().to_string()
+            };
+
+            existing_content
+                .examples
+                .insert(new_content_example_hash, RefOr::T(new_content_example));
+
+            existing_content.examples.extend(new_content.examples);
+        }
+    } else if !existing_content.examples.is_empty() {
+        // Simply append the new `Content`'s `example` and `examples` to the existing `examples` field.
+        // The keys will be derived from the hashed [`Example`][super::example::Example]s
+        // using the default hasher.
+
+        let new_content_example_value = new_content.example.unwrap();
+        let new_content_example_value_display = new_content_example_value.to_string();
+        let new_content_example = super::example::Example {
+            value: Some(new_content_example_value),
+            ..Default::default()
+        };
+        let new_content_example_hash = {
+            let mut default_hasher = DefaultHasher::new();
+            new_content_example_value_display.hash(&mut default_hasher);
+            default_hasher.finish().to_string()
+        };
+
+        existing_content
+            .examples
+            .insert(new_content_example_hash, RefOr::T(new_content_example));
+
+        existing_content.examples.extend(new_content.examples);
+    }
+
+    MergeResult::Merged
+}
+
+fn merge_responses(existing_response: &mut Response, new_response: Response) -> MergeResult {
+    // Perform partial response merge.
+    let merged_descriptions = format!(
+        "{}\n\n*OR*\n\n{}",
+        existing_response.description, new_response.description
+    );
+    existing_response.description = merged_descriptions;
+
+    existing_response.headers.extend(new_response.headers);
+
+    for (new_content_type, new_content) in new_response.content {
+        if let Some(existing_content) = existing_response.content.get_mut(&new_content_type) {
+            // Attempt to merge `Content`s.
+            let merge_result = merge_response_contents(existing_content, new_content);
+
+            // If the merge can't be performed, we must fall back to overwriting the entire response.
+            if merge_result == MergeResult::NonMergeable {
+                return MergeResult::NonMergeable;
+            }
+        } else {
+            existing_response
+                .content
+                .insert(new_content_type, new_content);
+        }
+    }
+
+    if let Some(new_extensions_map) = new_response.extensions {
+        if let Some(existing_extensions_map) = &mut existing_response.extensions {
+            existing_extensions_map.extend(new_extensions_map);
+        } else {
+            existing_response.extensions = Some(new_extensions_map);
+        }
+    }
+
+    MergeResult::Merged
+}
+
 impl Responses {
     pub fn new() -> Self {
         Default::default()
@@ -43,7 +180,36 @@ impl ResponsesBuilder {
         code: S,
         response: R,
     ) -> Self {
-        self.responses.insert(code.into(), response.into());
+        let code = code.into();
+        let response = response.into();
+
+        if let Some(existing_response) = self.responses.get_mut(&code) {
+            // Status code collision - attempt to merge responses.
+
+            let RefOr::T(existing_response_inner) = existing_response else {
+                // As the existing response is a reference,
+                // we can't modify it - give up (overwrites existing).
+                self.responses.insert(code, response);
+                return self;
+            };
+
+            let RefOr::T(new_response_inner) = response.clone() else {
+                // As the new response is a reference,
+                // we can't modify it - give up (overwrites existing).
+                self.responses.insert(code, response);
+                return self;
+            };
+
+            let merge_result = merge_responses(existing_response_inner, new_response_inner.clone());
+
+            if merge_result == MergeResult::NonMergeable {
+                // Failed to merge properly, fall back to overwriting.
+                self.responses.insert(code, response);
+            }
+        } else {
+            // No status code collision, proceed as usual.
+            self.responses.insert(code, response);
+        }
 
         self
     }
@@ -57,16 +223,19 @@ impl ResponsesBuilder {
         mut self,
         iter: I,
     ) -> Self {
-        self.responses.extend(
-            iter.into_iter()
-                .map(|(code, response)| (code.into(), response.into())),
-        );
+        for (code, response) in iter {
+            self = self.response(code, response);
+        }
+
         self
     }
 
     /// Add responses from a type that implements [`IntoResponses`].
     pub fn responses_from_into_responses<I: IntoResponses>(mut self) -> Self {
-        self.responses.extend(I::responses());
+        for (code, response) in I::responses() {
+            self = self.response(code, response);
+        }
+
         self
     }
 }
